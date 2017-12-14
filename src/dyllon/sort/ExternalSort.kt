@@ -7,6 +7,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.StandardOpenOption
 import java.util.*
+import java.util.concurrent.CompletableFuture
 import kotlin.NoSuchElementException
 
 interface Serializer<T> {
@@ -192,6 +193,12 @@ class BufferAllocator(val pageSize: Int) : Closeable {
         }
     }
 
+    fun readPage(address: Long) : ByteBuffer {
+        val result = ByteBuffer.allocateDirect(pageSize)
+        readPage(address, result)
+        return result
+    }
+
     fun readPage(address: Long, dest: ByteBuffer) {
         Files.newByteChannel(dataFile.toPath(), StandardOpenOption.READ).use {
             dest.position(0)
@@ -226,7 +233,7 @@ class BufferAllocator(val pageSize: Int) : Closeable {
 }
 
 abstract class ByteBufferOutputStream(pageSize: Int) : OutputStream() {
-    protected val buffer = ByteBuffer.allocateDirect(pageSize)
+    protected var buffer = ByteBuffer.allocateDirect(pageSize)
 
     override fun write(b: Int) {
         if (!buffer.hasRemaining()) {
@@ -327,20 +334,57 @@ class IndexedFile(private val allocator: BufferAllocator) : Closeable {
     private var firstAddr = 0L
 
     fun read() : DataInputStream {
-        val buffer = ByteBuffer.allocateDirect(allocator.pageSize)
+        var buffer = ByteBuffer.allocateDirect(allocator.pageSize)
         val sequence = object : Enumeration<InputStream> {
             private var nextAddr: Long = firstAddr
+            private var readTask: CompletableFuture<ByteBuffer?>
+            private var currentAddr: Long = 0L
+
+            init {
+                allocator.readPage(nextAddr, buffer)
+                currentAddr = nextAddr
+                nextAddr = buffer.getLong()
+                if (nextAddr != 0L) {
+                    readTask = CompletableFuture.supplyAsync {
+                        allocator.readPage(nextAddr)
+                    }
+                } else {
+                    readTask = CompletableFuture()
+                    readTask.complete(null)
+                }
+            }
+
+            private fun findNext() {
+                val result = readTask.get()
+                if (result == null) {
+                    currentAddr = 0L
+                } else {
+                    buffer = result
+                    currentAddr = nextAddr
+                    nextAddr = buffer.getLong()
+                }
+
+                if (nextAddr != 0L && currentAddr != 0L) {
+                    readTask = CompletableFuture.supplyAsync {
+                        allocator.readPage(nextAddr)
+                    }
+                } else {
+                    readTask = CompletableFuture()
+                    readTask.complete(null)
+                }
+            }
+
             var currentInput: ByteBufferInputStream? = null
 
             override fun hasMoreElements(): Boolean {
-                return nextAddr != 0L
+               return currentAddr != 0L
             }
 
             override fun nextElement(): InputStream {
-                allocator.readPage(nextAddr, buffer)
-                nextAddr = buffer.getLong()
+                readTask.get()
                 val result = ByteBufferInputStream(buffer)
                 currentInput = result
+                this.findNext()
                 return result
             }
         }
@@ -360,24 +404,35 @@ class IndexedFile(private val allocator: BufferAllocator) : Closeable {
             firstAddr = allocator.allocate()
         val result = object : ByteBufferOutputStream(allocator.pageSize) {
             private var currentAddr = firstAddr
+            private var lastWrite = CompletableFuture<Void>()
+            private var writingBuffer = ByteBuffer.allocateDirect(allocator.pageSize)
 
             init {
                 buffer.putLong(0L)
+                lastWrite.complete(null)
             }
 
             override fun flush() {
+                lastWrite.get()
                 val currentPos = this.buffer.position()
                 allocator.writePage(currentAddr, this.buffer)
                 this.buffer.position(currentPos)
             }
 
             override fun nextBuffer() {
-                val nextPage = allocator.allocate()
-                this.buffer.position(0)
-                this.buffer.putLong(nextPage)
-                allocator.writePage(currentAddr, this.buffer)
-                currentAddr = nextPage
+                lastWrite.get() // Must wait for last write to complete.
+                val temp = writingBuffer
+                writingBuffer = buffer
+                buffer = temp
                 buffer.putLong(0L)
+
+                lastWrite = CompletableFuture.runAsync(Runnable {
+                    val nextPage = allocator.allocate()
+                    this.writingBuffer.position(0)
+                    this.writingBuffer.putLong(nextPage)
+                    allocator.writePage(currentAddr, this.writingBuffer)
+                    currentAddr = nextPage
+                })
             }
         }
 
@@ -388,7 +443,7 @@ class IndexedFile(private val allocator: BufferAllocator) : Closeable {
 data class QueueItem<T>(val item: T, val source: ClosableIterator<T>)
 data class FileWithSize(val file: IndexedFile, val size: Long)
 
-val defaultPageSize = 16 * (1 shl 20)
+val defaultPageSize = 16_000_000
 val defaultMemory = Runtime.getRuntime().maxMemory() / 4
 class SmartIterator<T>(private var it: ClosableIterator<T>, private val serial: Serializer<T>, private val pageSize: Int = defaultPageSize, private val memory: Long = defaultMemory) : ClosableIterator<T> {
     constructor(it: Iterator<T>, serial: Serializer<T>, pageSize: Int = 128 * 1024, memory: Long = defaultMemory) : this(makeClosable(it), serial, pageSize, memory) {
@@ -455,7 +510,7 @@ class SmartIterator<T>(private var it: ClosableIterator<T>, private val serial: 
         }
         it.close()
 
-        val pageCount = memory / pageSize - 2
+        val pageCount = memory / (2 * pageSize) - 2 // Multiply page size by two due to double buffering.
         while (runs.size > 1) {
             val heapSorter = PriorityQueue<QueueItem<T>>(pageSize, { a, b -> comp.compare(a.item, b.item) })
             while (heapSorter.size < pageCount && runs.isNotEmpty()) {
@@ -601,7 +656,7 @@ fun main(args: Array<String>) {
     }
 
     val pageSize = defaultPageSize
-    SmartIterator(bigList, LargeObjectSerializer, memory = defaultMemory, pageSize = pageSize).use {
+    SmartIterator(readFile(File("sort_data"), pageSize), LargeObjectSerializer, memory = defaultMemory, pageSize = pageSize).use {
         it.sort(Comparator{ it1: LargeObject, it2: LargeObject ->
             var result = 0
             var pos = 0
