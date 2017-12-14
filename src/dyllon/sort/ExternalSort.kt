@@ -335,56 +335,39 @@ class IndexedFile(private val allocator: BufferAllocator) : Closeable {
 
     fun read() : DataInputStream {
         var buffer = ByteBuffer.allocateDirect(allocator.pageSize)
+        var readingBuffer = ByteBuffer.allocateDirect(allocator.pageSize)
         val sequence = object : Enumeration<InputStream> {
             private var nextAddr: Long = firstAddr
             private var readTask: CompletableFuture<ByteBuffer?>
-            private var currentAddr: Long = 0L
 
             init {
-                allocator.readPage(nextAddr, buffer)
-                currentAddr = nextAddr
-                nextAddr = buffer.getLong()
-                if (nextAddr != 0L) {
-                    readTask = CompletableFuture.supplyAsync {
-                        allocator.readPage(nextAddr)
-                    }
-                } else {
-                    readTask = CompletableFuture()
-                    readTask.complete(null)
-                }
+                readTask = readAsync(readingBuffer)
             }
 
-            private fun findNext() {
-                val result = readTask.get()
-                if (result == null) {
-                    currentAddr = 0L
-                } else {
-                    buffer = result
-                    currentAddr = nextAddr
-                    nextAddr = buffer.getLong()
-                }
-
-                if (nextAddr != 0L && currentAddr != 0L) {
-                    readTask = CompletableFuture.supplyAsync {
-                        allocator.readPage(nextAddr)
+            private fun readAsync(readInto: ByteBuffer) : CompletableFuture<ByteBuffer?> {
+                return if (nextAddr != 0L) {
+                    CompletableFuture.supplyAsync {
+                        allocator.readPage(nextAddr, readInto)
+                        readInto
                     }
                 } else {
-                    readTask = CompletableFuture()
-                    readTask.complete(null)
+                    CompletableFuture.completedFuture(null)
                 }
             }
 
             var currentInput: ByteBufferInputStream? = null
 
             override fun hasMoreElements(): Boolean {
-               return currentAddr != 0L
+               return nextAddr != 0L
             }
 
             override fun nextElement(): InputStream {
-                readTask.get()
+                val nextBuffer = readTask.get()
+                readingBuffer = buffer
+                buffer = nextBuffer
                 val result = ByteBufferInputStream(buffer)
                 currentInput = result
-                this.findNext()
+                readTask = readAsync(readingBuffer)
                 return result
             }
         }
