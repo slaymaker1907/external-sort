@@ -426,10 +426,10 @@ class IndexedFile(private val allocator: BufferAllocator) : Closeable {
 data class QueueItem<T>(val item: T, val source: ClosableIterator<T>)
 data class FileWithSize(val file: IndexedFile, val size: Long)
 
-val defaultPageSize = 16_000_000
+val defaultPageSize = 16 * (1 shl 20)
 val defaultMemory = Runtime.getRuntime().maxMemory() / 4
 class SmartIterator<T>(private var it: ClosableIterator<T>, private val serial: Serializer<T>, private val pageSize: Int = defaultPageSize, private val memory: Long = defaultMemory) : ClosableIterator<T> {
-    constructor(it: Iterator<T>, serial: Serializer<T>, pageSize: Int = 128 * 1024, memory: Long = defaultMemory) : this(makeClosable(it), serial, pageSize, memory) {
+    constructor(it: Iterator<T>, serial: Serializer<T>, pageSize: Int = defaultPageSize, memory: Long = defaultMemory) : this(makeClosable(it), serial, pageSize, memory) {
     }
 
     override fun hasNext(): Boolean {
@@ -465,6 +465,94 @@ class SmartIterator<T>(private var it: ClosableIterator<T>, private val serial: 
                 return result
             }
         }
+    }
+
+    fun removeDuplicates(comp: Comparator<T>) : SmartIterator<T> {
+        val runs = ArrayDeque<FileWithSize>()
+        val toSort = ExtensibleArray<T>()
+        val dumbOutput = DummyOutput()
+        val allocator = BufferAllocator(pageSize)
+        while (it.hasNext()) {
+            val file = allocator.createIndexed()
+            val output = file.writer()
+            while (it.hasNext() && dumbOutput.size < memory) {
+                val toAdd = it.next()
+                toSort.add(toAdd)
+                serial.serialize(toAdd, dumbOutput)
+                dumbOutput.writeLong(0) // Overhead for pointer.
+            }
+
+            toSort.parallelSort(comp)
+            var lastObj: T? = null
+            var uniqueSize = 0
+            for (ele in toSort) {
+                if (lastObj == null || comp.compare(lastObj, ele) != 0) {
+                    lastObj = ele
+                    serial.serialize(ele, output)
+                    uniqueSize++
+                }
+            }
+            output.close()
+            runs.add(FileWithSize(file, uniqueSize.toLong()))
+            toSort.clear()
+            dumbOutput.clear()
+        }
+        it.close()
+
+        val pageCount = memory / (2 * pageSize) - 2 // Multiply page size by two due to double buffering.
+        while (runs.size > 1) {
+            val heapSorter = PriorityQueue<QueueItem<T>>(pageSize, { a, b -> comp.compare(a.item, b.item) })
+            while (heapSorter.size < pageCount && runs.isNotEmpty()) {
+                val run = runs.removeFirst()
+                val it = this.closeIterator(run)
+                if (it.hasNext()) {
+                    heapSorter.add(QueueItem(it.next(), it))
+                } else {
+                    it.close()
+                }
+            }
+
+            // Merge together all the runs.
+            val file = allocator.createIndexed()
+            val output = file.writer()
+            var currentSize = 0L
+            var lastObj: T? = null
+            while (heapSorter.isNotEmpty()) {
+                val toAdd = heapSorter.poll()
+                val it = toAdd.source
+                if (it.hasNext()) {
+                    heapSorter.add(QueueItem(it.next(), it))
+                } else {
+                    it.close()
+                }
+
+                val current = toAdd.item
+                if (lastObj == null || comp.compare(lastObj, current) != 0) {
+                    currentSize++
+                    serial.serialize(toAdd.item, output)
+                }
+            }
+
+            output.close()
+            runs.add(FileWithSize(file, currentSize))
+        }
+
+        val result = this.closeIterator(runs.removeFirst())
+        this.it = object : ClosableIterator<T> {
+            override fun hasNext(): Boolean {
+                return result.hasNext()
+            }
+
+            override fun next(): T {
+                return result.next()
+            }
+
+            override fun close() {
+                result.close()
+                allocator.close()
+            }
+        }
+        return this
     }
 
     fun sort(comp: Comparator<T>) : SmartIterator<T> {
@@ -543,115 +631,4 @@ class SmartIterator<T>(private var it: ClosableIterator<T>, private val serial: 
         }
         return this
     }
-}
-
-object LongSerializer : Serializer<Long> {
-    override fun serialize(obj: Long, out: DataOutput) {
-        out.writeLong(obj)
-    }
-
-    override fun deserialize(inp: DataInput): Long {
-        return inp.readLong()
-    }
-}
-
-object ByteSerializer : Serializer<Byte> {
-    override fun serialize(obj: Byte, out: DataOutput) {
-        out.writeByte(obj.toInt())
-    }
-
-    override fun deserialize(inp: DataInput): Byte {
-        return inp.readByte()
-    }
-}
-
-object IntSerializer : Serializer<Int> {
-    override fun serialize(obj: Int, out: DataOutput) {
-        out.writeInt(obj)
-    }
-
-    override fun deserialize(inp: DataInput): Int {
-        return inp.readInt()
-    }
-}
-
-data class LargeObject(val key: ByteArray, val data: ByteArray)
-
-object LargeObjectSerializer : Serializer<LargeObject> {
-    override fun serialize(obj: LargeObject, out: DataOutput) {
-        out.write(obj.key)
-        out.write(obj.data)
-    }
-
-    override fun deserialize(inp: DataInput): LargeObject {
-        val key = ByteArray(10)
-        val data = ByteArray(90)
-        inp.readFully(key)
-        inp.readFully(data)
-        return LargeObject(key, data)
-    }
-}
-
-fun readFile(file: File, pageSize: Int) : ClosableIterator<LargeObject> {
-    val input = DataInputStream(BufferedInputStream(FileInputStream(file), pageSize))
-    return object : ClosableIterator<LargeObject> {
-        var current: LargeObject? = LargeObjectSerializer.deserialize(input)
-
-        override fun hasNext(): Boolean {
-            return current != null
-        }
-
-        override fun next(): LargeObject {
-            val result = current!!
-            try {
-                current = LargeObjectSerializer.deserialize(input)
-            } catch (e: EOFException) {
-                current = null
-                this.close()
-            }
-            return result
-        }
-
-        override fun close() {
-            input.close()
-        }
-    }
-}
-
-fun main(args: Array<String>) {
-    val start = System.currentTimeMillis()
-    var maxSize = 108L * (1 shl 24) / 2
-//    var maxSize = 3 * (1L shl 30) / 100
-    val bigList = object : Iterator<LargeObject> {
-            private val gen = Random(8675309)
-        private var pos = 0
-
-        override fun hasNext(): Boolean {
-            return pos < maxSize
-        }
-
-        override fun next(): LargeObject {
-            pos++
-            val key = ByteArray(10)
-            val data = ByteArray(90)
-            return LargeObject(key, data)
-        }
-    }
-
-    val pageSize = defaultPageSize
-    SmartIterator(readFile(File("sort_data"), pageSize), LargeObjectSerializer, memory = defaultMemory, pageSize = pageSize).use {
-        it.sort(Comparator{ it1: LargeObject, it2: LargeObject ->
-            var result = 0
-            var pos = 0
-            while (result == 0 && pos < 10) {
-                result = java.lang.Byte.compare(it1.key[pos], it2.key[pos])
-                pos++
-            }
-
-            result
-        })
-    }
-
-    val seconds = (System.currentTimeMillis() - start) / 1000.0
-    System.out.printf("Took %f seconds to sort.\n", seconds)
 }
