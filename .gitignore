@@ -2,4 +2,9 @@
 out/
 *.log
 sort_data
+external-sort.ipr
+external-sort.iml
+external-sort.iws
+build/
+.gradle/
 
