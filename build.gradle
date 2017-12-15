@@ -28,3 +28,9 @@ dependencies {
     compile 'org.jetbrains.kotlin:kotlin-stdlib-jdk8'
 }
 
+compileKotlin {
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+}
+
